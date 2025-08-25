@@ -1,0 +1,125 @@
+# BioRAG RSS Feed Sources
+# High-quality biomedical and scientific RSS feeds for testing and regular updates
+# Usage: python cli.py --rss <URL> --query "your question"
+
+# === PUBMED SEARCHES ===
+# Pre-configured PubMed searches for major topics
+
+# Cancer Research
+https://pubmed.ncbi.nlm.nih.gov/rss/search/1mYz0_pPam-sqp2Fa6pFpY8jQfqP4y6qSPWl8J1ELCCDkw/?limit=15&utm_campaign=pubmed-2&fc=20240101-000000
+# Note: Replace with actual PubMed RSS for cancer research
+
+# BRCA1/BRCA2 Research
+https://pubmed.ncbi.nlm.nih.gov/rss/search/cancer%20BRCA1%20BRCA2/?limit=20
+
+# DNA Repair Mechanisms
+https://pubmed.ncbi.nlm.nih.gov/rss/search/DNA%20repair%20homologous%20recombination/?limit=15
+
+# PARP Inhibitors
+https://pubmed.ncbi.nlm.nih.gov/rss/search/PARP%20inhibitor%20olaparib%20cancer/?limit=15
+
+# Immunotherapy Research
+https://pubmed.ncbi.nlm.nih.gov/rss/search/immunotherapy%20checkpoint%20inhibitor/?limit=20
+
+# Precision Medicine
+https://pubmed.ncbi.nlm.nih.gov/rss/search/precision%20medicine%20biomarker/?limit=15
+
+# === JOURNAL RSS FEEDS ===
+# Direct feeds from major scientific journals
+
+# Nature Medicine
+https://www.nature.com/nm.rss
+
+# Nature Genetics  
+https://www.nature.com/ng.rss
+
+# Nature Reviews Cancer
+https://www.nature.com/nrc.rss
+
+# Cell
+https://www.cell.com/cell/current.rss
+
+# Cell Reports
+https://www.cell.com/cell-reports/current.rss
+
+# Science Translational Medicine
+https://www.science.org/rss/journal_stm.xml
+
+# Journal of Clinical Oncology
+https://ascopubs.org/action/showFeed?type=etoc&feed=rss&jc=jco
+
+# Clinical Cancer Research
+https://clincancerres.aacrjournals.org/rss/current.xml
+
+# === PREPRINT SERVERS ===
+# Latest research before peer review
+
+# bioRxiv - Cancer Biology
+https://connect.biorxiv.org/biorxiv_xml.php?subject=cancer_biology
+
+# bioRxiv - Genetics
+https://connect.biorxiv.org/biorxiv_xml.php?subject=genetics
+
+# medRxiv - Oncology
+https://connect.medrxiv.org/medrxiv_xml.php?subject=oncology
+
+# === BIOMEDICAL NEWS ===
+# Science news and breakthroughs
+
+# NIH News
+https://www.nih.gov/news-events/news-releases/rss.xml
+
+# NCI Cancer Currents
+https://www.cancer.gov/rss/cancer-currents.xml
+
+# Science Daily - Cancer Research
+https://www.sciencedaily.com/rss/health_medicine/cancer.xml
+
+# Science Daily - Genetics
+https://www.sciencedaily.com/rss/health_medicine/genetics.xml
+
+# GenomeWeb
+https://www.genomeweb.com/rss.xml
+
+# === DRUG DEVELOPMENT ===
+# Pharmaceutical and therapeutic developments
+
+# FDA Drug Approvals
+https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/drug-safety-and-availability/rss.xml
+
+# BioPharma Dive
+https://www.biopharmadive.com/feeds/news/
+
+# === CONFERENCE PROCEEDINGS ===
+# Major biomedical conferences
+
+# ASCO (American Society of Clinical Oncology)
+# Check ASCO website for conference-specific RSS feeds
+
+# AACR (American Association for Cancer Research)  
+# Check AACR website for meeting RSS feeds
+
+# === TESTING FEEDS ===
+# Smaller, more manageable feeds for testing
+
+# Example test feed (replace with actual working RSS)
+# https://example.com/biomedical-test-feed.xml
+
+# === USAGE EXAMPLES ===
+# How to use these feeds with BioRAG:
+
+# Example 1: Latest cancer research
+# python cli.py --rss "https://pubmed.ncbi.nlm.nih.gov/rss/search/cancer/" --query "What are the latest cancer treatment breakthroughs?"
+
+# Example 2: BRCA research updates  
+# python cli.py --rss "https://pubmed.ncbi.nlm.nih.gov/rss/search/BRCA1%20BRCA2/" --query "How do BRCA mutations affect cancer risk?"
+
+# Example 3: Multiple feeds (use multiple --rss flags)
+# python cli.py --rss "https://www.nature.com/nm.rss" --rss "https://www.cell.com/cell/current.rss" --query "Summarize recent findings in precision medicine"
+
+# === NOTES ===
+# 1. Some RSS feeds may require registration or have rate limits
+# 2. PubMed RSS URLs are complex - use their RSS builder tool
+# 3. Always respect robots.txt and rate limits
+# 4. Test feeds individually before using in batch processing
+# 5. Some feeds may be behind paywalls - abstracts are usually free

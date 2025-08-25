@@ -1,0 +1,60 @@
+@import 'tailwindcss/base';
+@import 'tailwindcss/components';
+@import 'tailwindcss/utilities';
+
+:root {
+  --font-mono-ligs: 'calt,liga,ss01';
+}
+
+code, pre code {
+  font-feature-settings: var(--font-mono-ligs);
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d1d5db;
+  border-radius: 3px;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #4b5563;
+}
+
+/* Loading dots animation */
+.loading-dots span {
+  animation: loading-dots 1.4s ease-in-out infinite both;
+}
+
+.loading-dots span:nth-child(1) { 
+  animation-delay: -0.32s; 
+}
+
+.loading-dots span:nth-child(2) { 
+  animation-delay: -0.16s; 
+}
+
+/* Entity link styling */
+.bio-entity {
+  @apply text-emerald-600 hover:text-emerald-700 underline decoration-1 underline-offset-2 font-medium cursor-pointer;
+}
+
+.dark .bio-entity {
+  @apply text-emerald-400 hover:text-emerald-300;
+}
+
+/* Jargon tooltip styling */
+.jargon-term {
+  @apply text-blue-600 border-b border-dashed border-blue-600 cursor-help;
+}
+
+.dark .jargon-term {
+  @apply text-blue-400 border-blue-400;
+}
