@@ -31,7 +31,7 @@ class VectorDBManager:
     """
 
     def __init__(self,
-                 embedding_model: str = "allenai/scibert_scivocab_uncased",
+                 embedding_model: str = "scibert",  # Now maps to sentence-transformers model
                  persist_directory: str = "./vector_db",
                  collection_name: str = "biorag_docs"):
         """
@@ -76,11 +76,18 @@ class VectorDBManager:
 
         # Biomedical models mapping
         bio_models = {
-            "scibert": "allenai/scibert_scivocab_uncased",
-            "biobert": "dmis-lab/biobert-v1.1",
+            # PROPER sentence-transformers models (fine-tuned for similarity)
+            "scibert": "sentence-transformers/all-mpnet-base-v2",  # GPT's recommended baseline
+            "scibert-sentence": "pritamdeka/S-Scibert-snli-multinli-stsb",
+            "biobert-sentence": "pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb", 
+            "mpnet": "sentence-transformers/all-mpnet-base-v2",  # GPT's recommended baseline
+            "minilm": "sentence-transformers/all-MiniLM-L6-v2",
+            # Legacy BERT models (not recommended for retrieval)
+            "scibert-legacy": "allenai/scibert_scivocab_uncased",
+            "biobert": "dmis-lab/biobert-v1.1", 
             "pubmedbert": "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",
             "bioclinicalbert": "emilyalsentzer/Bio_ClinicalBERT",
-            "default": "sentence-transformers/all-MiniLM-L6-v2"
+            "default": "sentence-transformers/all-mpnet-base-v2"  # GPT's recommended baseline
         }
 
         # Resolve model name
