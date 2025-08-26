@@ -15,6 +15,11 @@ from langchain_community.llms import Ollama
 from langchain_openai import ChatOpenAI
 import asyncio
 from datetime import datetime
+import re
+
+# Import our ensemble retrieval fixes
+from .ensemble_retriever import EnsembleRetriever
+from .neighbor_expander import NeighborExpander
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +103,7 @@ class RAGChain:
         # Initialize retrievers with higher coverage for scientific papers
         self.retriever = vector_db.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": 20}  # Much more documents to catch edge cases
+            search_kwargs={"k": 40}  # Even more for ensemble fusion
         )
 
         self.mmr_retriever = vector_db.as_retriever(
@@ -106,8 +111,30 @@ class RAGChain:
             search_kwargs={"k": 15, "fetch_k": 40}  # Much higher diversity and coverage
         )
 
+        # Initialize ensemble retriever for scientific queries
+        try:
+            # Need to get documents for BM25 - will be set up during first document addition
+            self.ensemble_retriever = None
+            self.neighbor_expander = NeighborExpander(vector_db)
+            logger.info("✅ Enhanced retrieval system initialized (Ensemble + Neighbors)")
+        except Exception as e:
+            logger.warning(f"Enhanced retrieval setup failed: {str(e)}, falling back to dense only")
+
         # Initialize chains
         self._init_chains()
+
+    def setup_ensemble_retriever(self, documents: List[Document]):
+        """
+        Setup ensemble retriever once documents are available
+        Call this after documents are loaded into vector DB
+        """
+        try:
+            from .ensemble_retriever import EnsembleRetriever
+            self.ensemble_retriever = EnsembleRetriever(self.retriever, documents)
+            logger.info("✅ Ensemble retriever setup complete")
+        except Exception as e:
+            logger.warning(f"Ensemble retriever setup failed: {str(e)}")
+            self.ensemble_retriever = None
 
     def _init_llm(self, model_name: Optional[str] = None):
         """Initialize language model"""
@@ -361,7 +388,7 @@ class RAGChain:
     def _retrieve_documents(self,
                             queries: List[str],
                             use_mmr: bool = True) -> List[Document]:
-        """Retrieve documents for multiple queries"""
+        """Retrieve documents using enhanced ensemble + neighbor expansion"""
         all_docs = []
         seen_content = set()
 
@@ -369,16 +396,32 @@ class RAGChain:
             if not query or not query.strip():
                 continue
 
-            # Choose retriever
-            retriever = self.mmr_retriever if use_mmr else self.retriever
-
             try:
-                # Retrieve documents
-                docs = retriever.get_relevant_documents(query)
+                # Debug logging
+                logger.info(f"🔍 Processing query: '{query[:100]}'")
+                logger.info(f"🔍 Ensemble retriever available: {self.ensemble_retriever is not None}")
+                
+                # Check for scientific terms
+                has_scientific = self._has_numeric_terms(query)
+                logger.info(f"🔍 Has scientific terms: {has_scientific}")
+                
+                # Use ensemble retriever if available (BM25 + Dense)
+                if self.ensemble_retriever and has_scientific:
+                    logger.info(f"✅ Using ensemble retrieval for scientific query: {query[:50]}")
+                    docs = self.ensemble_retriever.get_relevant_documents(query, k=25)
+                else:
+                    logger.info(f"ℹ️ Using standard MMR retriever for query: {query[:50]}")
+                    # Choose standard retriever
+                    retriever = self.mmr_retriever if use_mmr else self.retriever
+                    docs = retriever.get_relevant_documents(query)
+
+                # Expand with neighbors for distributed details
+                if self.neighbor_expander and len(docs) > 0:
+                    logger.info("Expanding with neighbor chunks...")
+                    docs = self.neighbor_expander.expand_with_neighbors(docs, window=2)
 
                 # Deduplicate based on content hash
                 for doc in docs:
-                    # Create a hash of the first 200 characters
                     content_preview = doc.page_content[:200]
                     content_hash = hash(content_preview)
 
@@ -390,7 +433,13 @@ class RAGChain:
                         all_docs.append(doc)
 
             except Exception as e:
-                logger.error(f"Error retrieving documents for query '{query[:50]}...': {str(e)}")
+                logger.error(f"Error in enhanced retrieval for query '{query[:50]}...': {str(e)}")
+                # Fallback to basic retrieval
+                try:
+                    docs = self.retriever.get_relevant_documents(query)
+                    all_docs.extend(docs)
+                except:
+                    pass
 
         # Sort by relevance score if available
         try:
@@ -398,9 +447,53 @@ class RAGChain:
         except:
             pass
 
-        logger.info(f"Retrieved {len(all_docs)} unique documents")
-
+        logger.info(f"✅ Enhanced retrieval got {len(all_docs)} unique documents")
         return all_docs
+
+    def _has_numeric_terms(self, query: str) -> bool:
+        """Check if query contains numeric/scientific terms that benefit from BM25"""
+        # More comprehensive patterns for scientific queries
+        scientific_terms = [
+            # Direct compound names
+            'ascorbate', 'Fe2+', 'Fe3+', 'citrate', 'DMSO',
+            # Numeric patterns
+            r'\d+[-‒–—]\s*fold',  # "41-fold"
+            r'[~≈]\s*\d+',        # "~0.82"
+            r'\d+\s*[μu]M\s*h[-‒–—]?[¹1]',  # "μM h⁻¹"
+            r'λ\s*max\s*=\s*\d+',  # "λmax = 388"
+            r'\d+\s*nm',           # "388 nm"
+            r'\d+\s*°?C',          # "97°C"
+            r'\d+\s*kJ\s*m[-‒–—]?[²2]',  # "kJ m⁻²"
+            # Scientific processes
+            'formation process', 'light conditions', 'formation rates',
+            'temperature', 'wavelength', 'photolysis',
+            # Iron oxidation states
+            r'Fe[²³2+3+]', r'iron.*oxidation'
+        ]
+        
+        query_lower = query.lower()
+        
+        # Check each pattern
+        for term in scientific_terms:
+            if isinstance(term, str):
+                # Direct string match
+                if term in query_lower:
+                    logger.info(f"✅ Scientific term detected: {term}")
+                    return True
+            else:
+                # Regex pattern
+                if re.search(term, query, re.IGNORECASE):
+                    logger.info(f"✅ Scientific pattern detected: {term}")
+                    return True
+        
+        # Also trigger for any query mentioning specific scientific processes
+        process_terms = ['formation', 'conditions', 'rates', 'process', 'mechanism']
+        if any(term in query_lower for term in process_terms):
+            logger.info(f"✅ Scientific process query detected")
+            return True
+        
+        logger.info(f"❌ No scientific terms detected in query")
+        return False
 
     def _generate_answer(self, question: str, docs: List[Document]) -> str:
         """Generate answer using retrieved documents"""

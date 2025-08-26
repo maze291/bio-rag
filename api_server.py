@@ -197,11 +197,22 @@ def upload_files():
         if all_docs:
             if vector_db is None:
                 vector_db = db_manager.create_db(all_docs)
+                
+                # Setup ensemble retriever now that we have documents
+                if rag_chain:
+                    rag_chain.setup_ensemble_retriever(all_docs)
             else:
                 db_manager.add_documents(vector_db, all_docs)
+                
+                # Update ensemble retriever with new documents
+                if rag_chain:
+                    rag_chain.setup_ensemble_retriever(all_docs)
             
-            # Rebuild RAG chain
+            # Rebuild RAG chain with ensemble setup
             rag_chain = RAGChain(vector_db, entity_linker, glossary_mgr)
+            # Re-setup ensemble retriever on new chain
+            if all_docs:
+                rag_chain.setup_ensemble_retriever(all_docs)
         
         return jsonify({
             "success": True,
