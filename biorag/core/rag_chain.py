@@ -469,7 +469,7 @@ class RAGChain:
                 else:
                     logger.info(f"📥 Skipping neighbor expansion (expander={self.neighbor_expander is not None}, docs={len(docs)})")
 
-                # Deduplicate based on content hash
+                # Deduplicate based on content hash and apply section boosting
                 logger.info(f"📥 DEDUPLICATION: Processing {len(docs)} documents")
                 docs_added = 0
                 docs_duplicate = 0
@@ -480,9 +480,20 @@ class RAGChain:
 
                     if content_hash not in seen_content:
                         seen_content.add(content_hash)
+                        
                         # Add relevance score if not present
                         if 'score' not in doc.metadata:
                             doc.metadata['score'] = 1.0
+                        
+                        # Apply section-aware boosting for scientific queries
+                        original_score = doc.metadata['score']
+                        boosted_score = self._apply_section_boost(doc, has_scientific)
+                        doc.metadata['score'] = boosted_score
+                        
+                        if boosted_score != original_score:
+                            section = doc.metadata.get('section', 'unknown')
+                            logger.info(f"📥 Section boost applied: {section} ({original_score:.3f} → {boosted_score:.3f})")
+                        
                         all_docs.append(doc)
                         docs_added += 1
                     else:
@@ -517,13 +528,16 @@ class RAGChain:
         except Exception as sort_e:
             logger.error(f"💥 Sorting failed: {str(sort_e)}")
 
+        # Check for exact-match fast path (skip expensive reranking)
+        should_skip_reranker = self._should_skip_reranker(queries, all_docs)
+        
         # Apply cross-encoder reranking for better relevance
-        if len(all_docs) > 1 and self.reranker and self.reranker.is_available():
+        if len(all_docs) > 1 and self.reranker and self.reranker.is_available() and not should_skip_reranker:
             logger.info(f"🎯 CROSS-ENCODER RERANKING: Processing {len(all_docs)} documents")
             
-            # Rerank top 40 documents for efficiency (cross-encoders are slower)
-            docs_to_rerank = all_docs[:40] if len(all_docs) > 40 else all_docs
-            remaining_docs = all_docs[40:] if len(all_docs) > 40 else []
+            # Rerank top 15 documents for speed (fast path optimization)
+            docs_to_rerank = all_docs[:15] if len(all_docs) > 15 else all_docs
+            remaining_docs = all_docs[15:] if len(all_docs) > 15 else []
             
             # Get the original query for reranking
             original_query = queries[0] if queries else ""  # Use first query as primary
@@ -536,7 +550,10 @@ class RAGChain:
                 logger.error(f"💥 Reranking failed: {str(rerank_e)}")
                 logger.info(f"🔄 Continuing with original ranking")
         else:
-            logger.info(f"📥 Skipping reranking (docs={len(all_docs)}, reranker_available={self.reranker.is_available() if self.reranker else False})")
+            if should_skip_reranker:
+                logger.info(f"⚡ FAST PATH: Skipping reranker due to exact match confidence")
+            else:
+                logger.info(f"📥 Skipping reranking (docs={len(all_docs)}, reranker_available={self.reranker.is_available() if self.reranker else False})")
 
         logger.info(f"✅ RETRIEVAL COMPLETE: {len(all_docs)} unique documents ready for answer generation")
         return all_docs
@@ -545,7 +562,7 @@ class RAGChain:
         """Check if query contains numeric/scientific terms that benefit from BM25"""
         logger.info(f"🔬 SCIENTIFIC TERM ANALYSIS: Starting analysis of query: '{query}'")
         
-        # More comprehensive patterns for scientific queries
+        # Enhanced patterns for scientific queries (high-value detectors)
         scientific_terms = [
             # Direct compound names
             'ascorbate', 'Fe2+', 'Fe3+', 'citrate', 'DMSO', 'dmso', 'Fe', 'iron',
@@ -559,6 +576,20 @@ class RAGChain:
             r'\d+\s*nm',              # "388 nm"
             r'\d+\s*°?C',             # "97°C"
             r'\d+\s*kJ\s*m[-‒–—]?[²2]',  # "kJ m⁻²"
+            # Stats patterns (high-value addition)
+            r'p\s*[<≤]\s*0\.\d+',     # "p < 0.05"
+            r'95%\s*CI',              # "95% CI"
+            r'ANOVA|t[-\s]?test|FDR', # Statistical tests
+            # Genes/proteins (high-value addition)
+            r'[A-Z0-9]{2,5}\d?(?:-[A-Z0-9]+)?',  # Gene names like BRCA1, TP53
+            r'\w+ase\b',              # Enzymes ending in -ase
+            'subunit', 'isoform',     # Protein terminology
+            # Kinetics (high-value addition)
+            'kcat', 'Km', 'Vmax', 'rate constant',
+            # Spectra (high-value addition)
+            r'λ\s*max', r'\d+\s*nm',  # Wavelengths
+            # Isotopes/labels (high-value addition)
+            r'\b¹³C|\b¹⁵N|\bDMSO[-\s]?d6\b',  # Isotopic labels
             # Scientific processes
             'formation process', 'light conditions', 'formation rates',
             'temperature', 'wavelength', 'photolysis', 'experimental',
@@ -616,6 +647,84 @@ class RAGChain:
         logger.info(f"❌ FINAL RESULT: No scientific terms detected in query: '{query}'")
         logger.info(f"🎯 DECISION: Using standard MMR retrieval (no scientific terms found)")
         return False
+    
+    def _should_skip_reranker(self, queries: List[str], documents: List[Document]) -> bool:
+        """
+        Determine if we should skip expensive reranking (exact-match fast path)
+        Skip reranker when high confidence exact matches are found
+        """
+        if not queries or not documents:
+            return False
+        
+        # Get primary query
+        query = queries[0].lower()
+        
+        # Extract key numeric/unit phrases from query
+        exact_patterns = [
+            r'\d+\s*[-\-]?\s*fold',     # "41-fold"
+            r'\d+\s*°?C',               # "97°C"
+            r'\d+\s*nm',                # "388 nm"
+            r'\d+\.\d+\s*[μu]M',        # "0.82 μM"
+            r'p\s*[<≤]\s*0\.\d+',       # "p < 0.05"
+            r'λ\s*max\s*=?\s*\d+',      # "λmax = 388"
+        ]
+        
+        # Look for exact numeric matches in query
+        found_patterns = []
+        for pattern in exact_patterns:
+            matches = re.findall(pattern, query, re.IGNORECASE)
+            if matches:
+                found_patterns.extend(matches)
+        
+        if not found_patterns:
+            return False  # No exact patterns to match
+            
+        logger.info(f"⚡ FAST PATH CHECK: Found exact patterns in query: {found_patterns}")
+        
+        # Check if top documents contain these exact patterns
+        exact_matches = 0
+        for i, doc in enumerate(documents[:5]):  # Check top 5 only
+            content_lower = doc.page_content.lower()
+            
+            for pattern_text in found_patterns:
+                if pattern_text.lower() in content_lower:
+                    exact_matches += 1
+                    logger.info(f"⚡ EXACT MATCH found in doc #{i+1}: '{pattern_text}'")
+                    break  # One match per doc is enough
+        
+        # Skip reranker if we have strong exact matches in top results
+        overlap_ratio = exact_matches / min(len(documents), 5)
+        should_skip = overlap_ratio >= 0.6  # 60%+ of top docs have exact matches
+        
+        logger.info(f"⚡ FAST PATH DECISION: {exact_matches}/5 exact matches (ratio={overlap_ratio:.2f}), skip_reranker={should_skip}")
+        return should_skip
+    
+    def _apply_section_boost(self, doc: Document, has_scientific_terms: bool) -> float:
+        """Apply section-aware boosting for scientific queries"""
+        original_score = doc.metadata.get('score', 1.0)
+        
+        if not has_scientific_terms:
+            return original_score  # No boosting for non-scientific queries
+        
+        section = doc.metadata.get('section', 'content').lower()
+        
+        # Boost high-value sections for scientific queries
+        boost_factors = {
+            'methods': 1.2,           # Experimental procedures
+            'results': 1.15,          # Findings and observations  
+            'figure_caption': 1.25,   # Figures often contain key data
+            'table': 1.2,            # Tables contain measurements
+            'abstract': 1.1,          # Condensed key information
+            'content': 1.0,           # Default - no boost
+            'discussion': 0.95,       # Less likely to have exact measurements
+            'conclusion': 0.9,        # Summary, less specific data
+            'references': 0.8,        # Least relevant for data queries
+        }
+        
+        boost_factor = boost_factors.get(section, 1.0)
+        boosted_score = original_score * boost_factor
+        
+        return boosted_score
 
     def _generate_answer(self, question: str, docs: List[Document]) -> str:
         """Generate answer using retrieved documents"""
