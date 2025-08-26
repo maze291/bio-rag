@@ -113,9 +113,22 @@ class RAGChain:
 
         # Initialize ensemble retriever for scientific queries
         try:
-            # Need to get documents for BM25 - will be set up during first document addition
-            self.ensemble_retriever = None
             self.neighbor_expander = NeighborExpander(vector_db)
+            
+            # Try to set up ensemble retriever if documents already exist
+            self.ensemble_retriever = None
+            try:
+                # Check if vector DB has documents
+                doc_count = vector_db._collection.count() if hasattr(vector_db, '_collection') else 0
+                if doc_count > 0:
+                    # Try to get some documents from the vector DB to initialize BM25
+                    existing_docs = self._get_sample_documents_from_db(vector_db)
+                    if existing_docs:
+                        self.setup_ensemble_retriever(existing_docs)
+                        logger.info(f"✅ Auto-initialized ensemble retriever with {len(existing_docs)} sample docs")
+            except Exception as init_e:
+                logger.warning(f"Could not auto-initialize ensemble retriever: {str(init_e)}")
+                
             logger.info("✅ Enhanced retrieval system initialized (Ensemble + Neighbors)")
         except Exception as e:
             logger.warning(f"Enhanced retrieval setup failed: {str(e)}, falling back to dense only")
@@ -389,38 +402,59 @@ class RAGChain:
                             queries: List[str],
                             use_mmr: bool = True) -> List[Document]:
         """Retrieve documents using enhanced ensemble + neighbor expansion"""
+        logger.info(f"📥 RETRIEVAL PIPELINE: Starting document retrieval")
+        logger.info(f"📥 Input: {len(queries)} queries, use_mmr={use_mmr}")
+        
         all_docs = []
         seen_content = set()
 
-        for query in queries:
+        for query_idx, query in enumerate(queries):
             if not query or not query.strip():
+                logger.info(f"📥 Query {query_idx+1}: Skipping empty query")
                 continue
 
             try:
-                # Debug logging
-                logger.info(f"🔍 Processing query: '{query[:100]}'")
-                logger.info(f"🔍 Ensemble retriever available: {self.ensemble_retriever is not None}")
+                logger.info(f"📥 ========== PROCESSING QUERY {query_idx+1}/{len(queries)} ==========")
+                logger.info(f"📥 Query: '{query}'")
+                logger.info(f"📥 Query length: {len(query)} chars")
+                logger.info(f"📥 Ensemble retriever available: {self.ensemble_retriever is not None}")
                 
                 # Check for scientific terms
+                logger.info(f"📥 Analyzing query for scientific terms...")
                 has_scientific = self._has_numeric_terms(query)
-                logger.info(f"🔍 Has scientific terms: {has_scientific}")
+                logger.info(f"📥 Scientific analysis result: {has_scientific}")
                 
                 # Use ensemble retriever if available (BM25 + Dense)
                 if self.ensemble_retriever and has_scientific:
-                    logger.info(f"✅ Using ensemble retrieval for scientific query: {query[:50]}")
+                    logger.info(f"✅ DECISION: Using ENSEMBLE retrieval (BM25 + Dense)")
+                    logger.info(f"✅ Reason: Ensemble available AND scientific terms detected")
                     docs = self.ensemble_retriever.get_relevant_documents(query, k=25)
                 else:
-                    logger.info(f"ℹ️ Using standard MMR retriever for query: {query[:50]}")
+                    if not self.ensemble_retriever:
+                        logger.info(f"ℹ️ DECISION: Using STANDARD retrieval (ensemble not available)")
+                    else:
+                        logger.info(f"ℹ️ DECISION: Using STANDARD retrieval (no scientific terms)")
+                    
                     # Choose standard retriever
                     retriever = self.mmr_retriever if use_mmr else self.retriever
+                    retriever_type = "MMR" if use_mmr else "Similarity"
+                    logger.info(f"ℹ️ Using {retriever_type} retriever")
                     docs = retriever.get_relevant_documents(query)
+                    logger.info(f"ℹ️ Standard retrieval returned {len(docs)} documents")
 
                 # Expand with neighbors for distributed details
                 if self.neighbor_expander and len(docs) > 0:
-                    logger.info("Expanding with neighbor chunks...")
+                    logger.info(f"📥 NEIGHBOR EXPANSION: Processing {len(docs)} documents")
                     docs = self.neighbor_expander.expand_with_neighbors(docs, window=2)
+                    logger.info(f"📥 After neighbor expansion: {len(docs)} documents")
+                else:
+                    logger.info(f"📥 Skipping neighbor expansion (expander={self.neighbor_expander is not None}, docs={len(docs)})")
 
                 # Deduplicate based on content hash
+                logger.info(f"📥 DEDUPLICATION: Processing {len(docs)} documents")
+                docs_added = 0
+                docs_duplicate = 0
+                
                 for doc in docs:
                     content_preview = doc.page_content[:200]
                     content_hash = hash(content_preview)
@@ -431,68 +465,116 @@ class RAGChain:
                         if 'score' not in doc.metadata:
                             doc.metadata['score'] = 1.0
                         all_docs.append(doc)
+                        docs_added += 1
+                    else:
+                        docs_duplicate += 1
+                
+                logger.info(f"📥 Deduplication: {docs_added} new, {docs_duplicate} duplicates")
+                logger.info(f"📥 Running total: {len(all_docs)} unique documents")
 
             except Exception as e:
-                logger.error(f"Error in enhanced retrieval for query '{query[:50]}...': {str(e)}")
+                logger.error(f"💥 Error in enhanced retrieval for query '{query[:50]}...': {str(e)}")
+                logger.info(f"📥 Attempting fallback retrieval...")
                 # Fallback to basic retrieval
                 try:
-                    docs = self.retriever.get_relevant_documents(query)
-                    all_docs.extend(docs)
-                except:
-                    pass
+                    fallback_docs = self.retriever.get_relevant_documents(query)
+                    all_docs.extend(fallback_docs)
+                    logger.info(f"📥 Fallback successful: {len(fallback_docs)} documents added")
+                except Exception as fallback_e:
+                    logger.error(f"💥 Fallback also failed: {str(fallback_e)}")
 
         # Sort by relevance score if available
+        logger.info(f"📥 FINAL SORTING: Sorting {len(all_docs)} documents by relevance score")
         try:
             all_docs.sort(key=lambda d: d.metadata.get('score', 0), reverse=True)
-        except:
-            pass
+            logger.info(f"📥 Sorting successful")
+            
+            # Log top documents
+            logger.info(f"📥 Top 3 documents after sorting:")
+            for i, doc in enumerate(all_docs[:3]):
+                score = doc.metadata.get('score', 'N/A')
+                preview = doc.page_content[:100].replace('\n', ' ')
+                logger.info(f"📥 #{i+1} (score={score}): {preview}...")
+        except Exception as sort_e:
+            logger.error(f"💥 Sorting failed: {str(sort_e)}")
 
-        logger.info(f"✅ Enhanced retrieval got {len(all_docs)} unique documents")
+        logger.info(f"✅ RETRIEVAL COMPLETE: {len(all_docs)} unique documents ready for answer generation")
         return all_docs
 
     def _has_numeric_terms(self, query: str) -> bool:
         """Check if query contains numeric/scientific terms that benefit from BM25"""
+        logger.info(f"🔬 SCIENTIFIC TERM ANALYSIS: Starting analysis of query: '{query}'")
+        
         # More comprehensive patterns for scientific queries
         scientific_terms = [
             # Direct compound names
-            'ascorbate', 'Fe2+', 'Fe3+', 'citrate', 'DMSO',
+            'ascorbate', 'Fe2+', 'Fe3+', 'citrate', 'DMSO', 'dmso', 'Fe', 'iron',
             # Numeric patterns
-            r'\d+[-‒–—]\s*fold',  # "41-fold"
-            r'[~≈]\s*\d+',        # "~0.82"
+            r'\d+\s*[-\-]?\s*fold',   # "41-fold", "41 fold", "41-fold"  
+            r'\d+\s*fold',            # Simple "41fold" pattern
+            r'[~≈]\s*\d+',            # "~0.82"
+            r'\d+\.\d+',              # "0.82", "97.5"
             r'\d+\s*[μu]M\s*h[-‒–—]?[¹1]',  # "μM h⁻¹"
-            r'λ\s*max\s*=\s*\d+',  # "λmax = 388"
-            r'\d+\s*nm',           # "388 nm"
-            r'\d+\s*°?C',          # "97°C"
+            r'λ\s*max\s*=\s*\d+',     # "λmax = 388"
+            r'\d+\s*nm',              # "388 nm"
+            r'\d+\s*°?C',             # "97°C"
             r'\d+\s*kJ\s*m[-‒–—]?[²2]',  # "kJ m⁻²"
             # Scientific processes
             'formation process', 'light conditions', 'formation rates',
-            'temperature', 'wavelength', 'photolysis',
+            'temperature', 'wavelength', 'photolysis', 'experimental',
+            'conditions', 'concentration', 'buffer', 'pH',
             # Iron oxidation states
             r'Fe[²³2+3+]', r'iron.*oxidation'
         ]
         
         query_lower = query.lower()
+        logger.info(f"🔬 Query lowercased: '{query_lower}'")
         
-        # Check each pattern
-        for term in scientific_terms:
+        # Check each pattern with detailed logging
+        logger.info(f"🔬 Checking {len(scientific_terms)} scientific patterns...")
+        
+        for i, term in enumerate(scientific_terms):
             if isinstance(term, str):
                 # Direct string match
+                logger.info(f"🔬 Pattern {i+1}/{len(scientific_terms)}: Checking string '{term}' in query_lower")
                 if term in query_lower:
-                    logger.info(f"✅ Scientific term detected: {term}")
+                    logger.info(f"✅ MATCH! Scientific term detected: '{term}' found in '{query_lower}'")
+                    logger.info(f"🎯 DECISION: Using ensemble retrieval due to scientific term: {term}")
                     return True
+                else:
+                    logger.info(f"❌ No match for string pattern: '{term}'")
             else:
                 # Regex pattern
-                if re.search(term, query, re.IGNORECASE):
-                    logger.info(f"✅ Scientific pattern detected: {term}")
+                logger.info(f"🔬 Pattern {i+1}/{len(scientific_terms)}: Checking regex '{term}' against query")
+                match = re.search(term, query, re.IGNORECASE)
+                if match:
+                    logger.info(f"✅ MATCH! Scientific regex pattern detected: '{term}' matched '{match.group()}' in query")
+                    logger.info(f"🎯 DECISION: Using ensemble retrieval due to regex pattern: {term}")
                     return True
+                else:
+                    logger.info(f"❌ No match for regex pattern: '{term}'")
         
-        # Also trigger for any query mentioning specific scientific processes
-        process_terms = ['formation', 'conditions', 'rates', 'process', 'mechanism']
-        if any(term in query_lower for term in process_terms):
-            logger.info(f"✅ Scientific process query detected")
+        # Enhanced process terms - more comprehensive
+        logger.info(f"🔬 Checking secondary process terms...")
+        process_terms = ['formation', 'conditions', 'rates', 'process', 'mechanism',
+                        'experimental', 'concentration', 'buffer', 'specific', 'mentioned']
+        
+        for term in process_terms:
+            if term in query_lower:
+                logger.info(f"✅ MATCH! Scientific process term detected: '{term}' in '{query_lower}'")
+                logger.info(f"🎯 DECISION: Using ensemble retrieval due to process term: {term}")
+                return True
+            
+        # Check for any numbers that might indicate scientific measurements
+        logger.info(f"🔬 Checking for numeric patterns in query...")
+        number_match = re.search(r'\d+', query)
+        if number_match:
+            logger.info(f"✅ MATCH! Numeric pattern detected: '{number_match.group()}' in query")
+            logger.info(f"🎯 DECISION: Using ensemble retrieval due to numeric content")
             return True
         
-        logger.info(f"❌ No scientific terms detected in query")
+        logger.info(f"❌ FINAL RESULT: No scientific terms detected in query: '{query}'")
+        logger.info(f"🎯 DECISION: Using standard MMR retrieval (no scientific terms found)")
         return False
 
     def _generate_answer(self, question: str, docs: List[Document]) -> str:
@@ -821,3 +903,26 @@ class RAGChain:
             return ', '.join([term for term, count in common_terms])
         
         return "chemistry and biochemistry"
+    
+    def _get_sample_documents_from_db(self, vector_db) -> List[Document]:
+        """Get sample documents from vector DB to initialize BM25"""
+        try:
+            # Get a sample of documents from the database
+            collection = vector_db._collection
+            results = collection.get(limit=50, include=["documents", "metadatas"])
+            
+            if not results or not results.get('documents'):
+                return []
+            
+            documents = []
+            for i, content in enumerate(results['documents']):
+                metadata = results['metadatas'][i] if results.get('metadatas') and i < len(results['metadatas']) else {}
+                doc = Document(page_content=content, metadata=metadata)
+                documents.append(doc)
+            
+            logger.info(f"Retrieved {len(documents)} sample documents for BM25 initialization")
+            return documents
+            
+        except Exception as e:
+            logger.warning(f"Failed to get sample documents: {str(e)}")
+            return []

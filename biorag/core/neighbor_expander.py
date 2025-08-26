@@ -28,55 +28,86 @@ class NeighborExpander:
             docs: Initial retrieved documents
             window: How many neighbors to fetch each side (±window)
         """
+        logger.info(f"🔗 NEIGHBOR EXPANSION: Starting expansion of {len(docs)} documents")
+        logger.info(f"🔗 Window size: ±{window} neighbors per document")
+        
         try:
             expanded_docs = []
             seen_keys = set()
             
-            logger.info(f"Expanding {len(docs)} docs with ±{window} neighbors")
-            
-            for doc in docs:
+            for doc_idx, doc in enumerate(docs):
+                logger.info(f"🔗 ========== PROCESSING DOC {doc_idx+1}/{len(docs)} ==========")
+                
                 # Add original document
                 doc_key = self._get_doc_key(doc)
+                logger.info(f"🔗 Original doc key: {doc_key}")
+                
                 if doc_key not in seen_keys:
                     expanded_docs.append(doc)
                     seen_keys.add(doc_key)
+                    logger.info(f"🔗 Added original document")
+                else:
+                    logger.info(f"🔗 Skipping duplicate original document")
                 
                 # Try to get neighbors
                 if hasattr(doc, 'metadata') and doc.metadata:
                     doc_id = doc.metadata.get('doc_id')
                     chunk_idx = doc.metadata.get('chunk_idx')
                     
+                    logger.info(f"🔗 Document metadata: doc_id={doc_id}, chunk_idx={chunk_idx}")
+                    
                     if doc_id is not None and chunk_idx is not None:
                         try:
-                            chunk_idx = int(chunk_idx)
+                            chunk_idx_int = int(chunk_idx)
+                            logger.info(f"🔗 Valid chunk_idx: {chunk_idx_int}")
+                            
+                            neighbors_found = 0
+                            neighbors_skipped = 0
                             
                             # Fetch neighboring chunks
                             for offset in range(-window, window + 1):
                                 if offset == 0:  # Skip original
                                     continue
                                     
-                                neighbor_idx = chunk_idx + offset
+                                neighbor_idx = chunk_idx_int + offset
                                 if neighbor_idx < 0:  # No negative indices
+                                    logger.info(f"🔗 Skipping negative neighbor index: {neighbor_idx}")
                                     continue
                                 
-                                # Try to fetch neighbor
                                 neighbor_key = f"{doc_id}_{neighbor_idx}"
+                                logger.info(f"🔗 Checking neighbor: {neighbor_key} (offset={offset})")
+                                
+                                # Try to fetch neighbor
                                 if neighbor_key in seen_keys:
+                                    logger.info(f"🔗 Neighbor already seen: {neighbor_key}")
+                                    neighbors_skipped += 1
                                     continue
                                 
                                 neighbor_doc = self._fetch_by_id(doc_id, neighbor_idx)
                                 if neighbor_doc:
                                     expanded_docs.append(neighbor_doc)
                                     seen_keys.add(neighbor_key)
+                                    neighbors_found += 1
+                                    preview = neighbor_doc.page_content[:100].replace('\n', ' ')
+                                    logger.info(f"🔗 ✅ Added neighbor {neighbor_key}: {preview}...")
+                                else:
+                                    logger.info(f"🔗 ❌ Neighbor not found: {neighbor_key}")
+                            
+                            logger.info(f"🔗 Document summary: {neighbors_found} neighbors added, {neighbors_skipped} skipped")
                                     
                         except (ValueError, TypeError) as e:
-                            logger.warning(f"Could not parse chunk_idx: {chunk_idx}")
+                            logger.warning(f"🔗 Could not parse chunk_idx '{chunk_idx}': {str(e)}")
+                    else:
+                        logger.info(f"🔗 No valid doc_id/chunk_idx metadata for expansion")
+                else:
+                    logger.info(f"🔗 No metadata available for expansion")
             
-            logger.info(f"✅ Expanded to {len(expanded_docs)} docs (including neighbors)")
+            logger.info(f"✅ NEIGHBOR EXPANSION COMPLETE: {len(expanded_docs)} total documents ({len(docs)} original + {len(expanded_docs) - len(docs)} neighbors)")
             return expanded_docs
             
         except Exception as e:
-            logger.error(f"Neighbor expansion failed: {str(e)}")
+            logger.error(f"💥 Neighbor expansion failed: {str(e)}")
+            logger.info(f"🔗 Returning original {len(docs)} documents")
             return docs  # Return original if expansion fails
     
     def _get_doc_key(self, doc: Document) -> str:
