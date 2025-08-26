@@ -20,6 +20,7 @@ import re
 # Import our ensemble retrieval fixes
 from .ensemble_retriever import EnsembleRetriever
 from .neighbor_expander import NeighborExpander
+from .reranker import CrossEncoderReranker
 
 logger = logging.getLogger(__name__)
 
@@ -111,9 +112,12 @@ class RAGChain:
             search_kwargs={"k": 15, "fetch_k": 40}  # Much higher diversity and coverage
         )
 
-        # Initialize ensemble retriever for scientific queries
+        # Initialize enhanced retrieval components
         try:
             self.neighbor_expander = NeighborExpander(vector_db)
+            
+            # Initialize cross-encoder reranker
+            self.reranker = CrossEncoderReranker()
             
             # Try to set up ensemble retriever if documents already exist
             self.ensemble_retriever = None
@@ -129,9 +133,11 @@ class RAGChain:
             except Exception as init_e:
                 logger.warning(f"Could not auto-initialize ensemble retriever: {str(init_e)}")
                 
-            logger.info("✅ Enhanced retrieval system initialized (Ensemble + Neighbors)")
+            logger.info("✅ Enhanced retrieval system initialized (Ensemble + Neighbors + Reranker)")
         except Exception as e:
             logger.warning(f"Enhanced retrieval setup failed: {str(e)}, falling back to dense only")
+            self.neighbor_expander = None
+            self.reranker = None
 
         # Initialize chains
         self._init_chains()
@@ -143,7 +149,20 @@ class RAGChain:
         """
         try:
             from .ensemble_retriever import EnsembleRetriever
-            self.ensemble_retriever = EnsembleRetriever(self.retriever, documents)
+            
+            # Ensure all documents have proper metadata for neighbor expansion
+            enhanced_docs = []
+            for doc in documents:
+                if not doc.metadata.get('doc_id') or not doc.metadata.get('chunk_idx'):
+                    logger.info(f"📥 Enhancing document metadata for ensemble retriever compatibility")
+                    # Add missing metadata if needed
+                    if 'doc_id' not in doc.metadata:
+                        doc.metadata['doc_id'] = f"doc_{hash(doc.page_content[:100]) % 10000}"
+                    if 'chunk_idx' not in doc.metadata:
+                        doc.metadata['chunk_idx'] = doc.metadata.get('chunk_id', 0)
+                enhanced_docs.append(doc)
+            
+            self.ensemble_retriever = EnsembleRetriever(self.retriever, enhanced_docs)
             logger.info("✅ Ensemble retriever setup complete")
         except Exception as e:
             logger.warning(f"Ensemble retriever setup failed: {str(e)}")
@@ -489,14 +508,35 @@ class RAGChain:
             all_docs.sort(key=lambda d: d.metadata.get('score', 0), reverse=True)
             logger.info(f"📥 Sorting successful")
             
-            # Log top documents
-            logger.info(f"📥 Top 3 documents after sorting:")
+            # Log top documents before reranking
+            logger.info(f"📥 Top 3 documents before reranking:")
             for i, doc in enumerate(all_docs[:3]):
                 score = doc.metadata.get('score', 'N/A')
                 preview = doc.page_content[:100].replace('\n', ' ')
                 logger.info(f"📥 #{i+1} (score={score}): {preview}...")
         except Exception as sort_e:
             logger.error(f"💥 Sorting failed: {str(sort_e)}")
+
+        # Apply cross-encoder reranking for better relevance
+        if len(all_docs) > 1 and self.reranker and self.reranker.is_available():
+            logger.info(f"🎯 CROSS-ENCODER RERANKING: Processing {len(all_docs)} documents")
+            
+            # Rerank top 40 documents for efficiency (cross-encoders are slower)
+            docs_to_rerank = all_docs[:40] if len(all_docs) > 40 else all_docs
+            remaining_docs = all_docs[40:] if len(all_docs) > 40 else []
+            
+            # Get the original query for reranking
+            original_query = queries[0] if queries else ""  # Use first query as primary
+            
+            try:
+                reranked_docs = self.reranker.rerank(original_query, docs_to_rerank)
+                all_docs = reranked_docs + remaining_docs
+                logger.info(f"🎯 Reranking complete: reranked {len(reranked_docs)} docs, {len(remaining_docs)} remaining")
+            except Exception as rerank_e:
+                logger.error(f"💥 Reranking failed: {str(rerank_e)}")
+                logger.info(f"🔄 Continuing with original ranking")
+        else:
+            logger.info(f"📥 Skipping reranking (docs={len(all_docs)}, reranker_available={self.reranker.is_available() if self.reranker else False})")
 
         logger.info(f"✅ RETRIEVAL COMPLETE: {len(all_docs)} unique documents ready for answer generation")
         return all_docs

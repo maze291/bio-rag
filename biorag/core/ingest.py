@@ -519,15 +519,25 @@ class IngestPipeline:
 
         # Create Document objects
         documents = []
+        
+        # Generate document ID if not present
+        doc_id = metadata.get('doc_id') or self._generate_doc_id(metadata)
+        
         for i, chunk in enumerate(chunks):
             # Skip empty chunks
             if not chunk.strip():
                 continue
 
-            # Create chunk metadata
+            # Determine section based on content
+            section = self._extract_section(chunk)
+
+            # Create comprehensive chunk metadata
             chunk_metadata = metadata.copy()
             chunk_metadata.update({
-                'chunk_id': i,
+                'doc_id': doc_id,           # Required for neighbor expansion
+                'chunk_idx': i,             # Required for neighbor expansion  
+                'section': section,         # Required for section-aware retrieval
+                'chunk_id': i,              # Legacy compatibility
                 'chunk_total': len(chunks),
                 'chunk_size': len(chunk)
             })
@@ -669,3 +679,57 @@ class IngestPipeline:
         # Clear cache since parameters changed
         self.doc_cache.clear()
         logger.info(f"Updated chunk parameters: size={chunk_size}, overlap={chunk_overlap}")
+    
+    def _generate_doc_id(self, metadata: Dict[str, Any]) -> str:
+        """Generate a unique document ID from metadata"""
+        # Use filename or source if available
+        if 'filename' in metadata:
+            base = Path(metadata['filename']).stem
+        elif 'source' in metadata:
+            base = Path(metadata['source']).stem
+        elif 'title' in metadata:
+            base = re.sub(r'[^\w\-_]', '_', metadata['title'][:50])
+        else:
+            base = "doc"
+        
+        # Add hash for uniqueness
+        content_hash = hashlib.md5(str(metadata).encode()).hexdigest()[:8]
+        return f"{base}_{content_hash}"
+    
+    def _extract_section(self, chunk: str) -> str:
+        """Extract section type from chunk content"""
+        chunk_lower = chunk.lower().strip()
+        
+        # Check for section markers added during PDF parsing
+        if chunk.startswith('[FIGURE CAPTION]'):
+            return "figure_caption"
+        elif chunk.startswith('[TABLE]'):
+            return "table"
+        elif chunk.startswith('[SECTION:'):
+            return "header"
+        elif chunk.startswith('[TITLE:'):
+            return "title"
+        
+        # Check for common section headers
+        first_lines = '\n'.join(chunk_lower.split('\n')[:3])
+        
+        if any(keyword in first_lines for keyword in ['abstract', 'summary']):
+            return "abstract"
+        elif any(keyword in first_lines for keyword in ['introduction', 'background']):
+            return "introduction"
+        elif any(keyword in first_lines for keyword in ['method', 'experimental', 'procedure']):
+            return "methods"
+        elif any(keyword in first_lines for keyword in ['result', 'findings', 'observation']):
+            return "results"
+        elif any(keyword in first_lines for keyword in ['discussion', 'interpretation']):
+            return "discussion"
+        elif any(keyword in first_lines for keyword in ['conclusion', 'summary', 'implications']):
+            return "conclusion"
+        elif any(keyword in first_lines for keyword in ['reference', 'bibliography', 'citation']):
+            return "references"
+        elif any(keyword in first_lines for keyword in ['figure', 'fig.', 'caption']):
+            return "figure_caption"
+        elif any(keyword in first_lines for keyword in ['table', 'tab.']):
+            return "table"
+        else:
+            return "content"

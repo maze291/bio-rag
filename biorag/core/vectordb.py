@@ -142,13 +142,13 @@ class VectorDBManager:
         # Save metadata about the database
         self._save_metadata()
 
-        # Create Chroma instance
+        # Create Chroma instance with cosine distance
         vectordb = Chroma.from_documents(
             documents=documents,
             embedding=self.embeddings,
             persist_directory=self.persist_directory,
             collection_name=self.collection_name,
-            collection_metadata={"hnsw:space": "cosine"}
+            collection_metadata={"hnsw:space": "cosine"}  # Use cosine distance for better semantic similarity
         )
 
         # Persist to disk

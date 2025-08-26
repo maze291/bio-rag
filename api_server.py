@@ -6,6 +6,7 @@ Provides HTTP endpoints for the React frontend to communicate with BioRAG backen
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import json
 import sys
 from pathlib import Path
 import tempfile
@@ -86,11 +87,30 @@ def health_check():
 
 @app.route('/api/query', methods=['POST'])
 def query():
-    """Process a user query"""
+    """Process a user query with UTF-8 hardening"""
     global rag_chain
     
     try:
-        data = request.get_json()
+        # UTF-8 hardening for degree symbols and other Unicode
+        try:
+            data = request.get_json()
+        except Exception as json_error:
+            # Fallback: handle potential UTF-8 encoding issues
+            try:
+                body = request.get_data()
+                if isinstance(body, bytes):
+                    body_str = body.decode('utf-8', errors='replace')
+                else:
+                    body_str = str(body)
+                data = json.loads(body_str)
+            except Exception as fallback_error:
+                return jsonify({
+                    "error": f"JSON parsing failed: {str(json_error)}. Fallback also failed: {str(fallback_error)}",
+                    "enhanced_answer": "Unable to parse request. Please ensure your query uses proper UTF-8 encoding.",
+                    "entities": [],
+                    "source_docs": []
+                }), 400
+        
         query_text = data.get('query', '')
         enable_hyde = data.get('enable_hyde', True)
         enable_decomposition = data.get('enable_decomposition', True)
