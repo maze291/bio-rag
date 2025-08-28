@@ -35,7 +35,7 @@ class CrossEncoderReranker:
     
     def rerank(self, query: str, documents: List[Document], top_k: Optional[int] = None) -> List[Document]:
         """
-        Rerank documents by relevance to query
+        Rerank documents by relevance to query with numerical boost
         
         Args:
             query: User query
@@ -56,7 +56,43 @@ class CrossEncoderReranker:
         logger.info(f"🎯 RERANKING: Starting rerank of {len(documents)} documents")
         logger.info(f"🎯 Query: '{query[:100]}{'...' if len(query) > 100 else ''}'")
         
+        # Extract numerical patterns from query for boosting
+        import re
+        query_numbers = set(re.findall(r'\d+\.?\d*', query))
+        scientific_patterns = [
+            r'\d+[\-−]fold',  # fold changes
+            r'[~≈]\d+\.?\d*', # approximate values  
+            r'\d+\s*°C',      # temperatures
+            r'\d+\s*nm',      # wavelengths
+            r'\d+\.?\d*\s*[μu]M', # concentrations
+        ]
+        
+        query_patterns = []
+        for pattern in scientific_patterns:
+            matches = re.findall(pattern, query, re.IGNORECASE)
+            query_patterns.extend(matches)
+        
+        logger.info(f"🎯 Query numerical patterns: numbers={query_numbers}, patterns={query_patterns}")
+        
         try:
+            # Apply numerical boost scoring before reranking
+            for doc in documents:
+                doc_numbers = set(re.findall(r'\d+\.?\d*', doc.page_content))
+                numerical_overlap = len(query_numbers & doc_numbers)
+                
+                # Check for exact pattern matches
+                pattern_matches = 0
+                for pattern_text in query_patterns:
+                    if pattern_text.lower() in doc.page_content.lower():
+                        pattern_matches += 1
+                
+                # Calculate numerical boost (0.0 to 0.3 boost)
+                numerical_boost = min(0.3, (numerical_overlap * 0.1) + (pattern_matches * 0.15))
+                doc.metadata['numerical_boost'] = numerical_boost
+                
+                if numerical_boost > 0:
+                    logger.info(f"🎯 Numerical boost: {numerical_boost:.3f} (numbers={numerical_overlap}, patterns={pattern_matches})")
+            
             # Prepare query-document pairs
             pairs = []
             doc_previews = []
@@ -84,8 +120,18 @@ class CrossEncoderReranker:
                 preview = doc.page_content[:80].replace('\n', ' ')
                 logger.info(f"🎯 #{i+1} (score={score:.4f}): {preview}...")
             
-            # Sort by relevance score (descending)
-            scored_docs = list(zip(documents, scores))
+            # Apply numerical boost to cross-encoder scores
+            boosted_scores = []
+            for doc, score in zip(documents, scores):
+                numerical_boost = doc.metadata.get('numerical_boost', 0.0)
+                boosted_score = score + numerical_boost
+                boosted_scores.append(boosted_score)
+                
+                if numerical_boost > 0:
+                    logger.info(f"🎯 Score boost: {score:.4f} + {numerical_boost:.3f} = {boosted_score:.4f}")
+            
+            # Sort by boosted relevance score (descending)
+            scored_docs = list(zip(documents, boosted_scores))
             scored_docs.sort(key=lambda x: x[1], reverse=True)
             
             # Extract reranked documents and update metadata

@@ -43,7 +43,7 @@ class IngestPipeline:
 
     def __init__(self,
                  chunk_size: int = 1500,  # Larger chunks for scientific papers
-                 chunk_overlap: int = 300,  # More overlap to preserve context
+                 chunk_overlap: int = 450,  # Increased overlap for numerical continuity
                  separators: Optional[List[str]] = None,
                  enable_ocr: bool = True):
         """
@@ -615,9 +615,19 @@ class IngestPipeline:
         text = re.sub(r'(\d+\.?\d*)\s*μM\s*h[\-−]1', r'\1 μM·h⁻¹', text)
         text = re.sub(r'(\d+\.?\d*)\s*uM\s*h[\-−]1', r'\1 μM·h⁻¹', text)
         
-        # Fix fold increase patterns
+        # Fix fold increase patterns - preserve complete expressions
         text = re.sub(r'(\d+)[\-−]\s*fold', r'\1-fold', text)
         text = re.sub(r'(\d+)\s*×\s*fold', r'\1× fold', text)
+        
+        # Preserve numerical ranges with units (e.g., "41-fold to ~0.82 μM h⁻¹")
+        text = re.sub(r'(\d+[\-−]fold\s+to\s+[~≈]?\d+\.?\d*\s*[μu]M\s*h[\-−]¹)', r'\1', text, flags=re.IGNORECASE)
+        
+        # Preserve complete measurement expressions
+        # Pattern: "rates increased X-fold to Y units at Z°C"
+        text = re.sub(r'(rates?\s+increased?\s+\d+[\-−]fold\s+to\s+[~≈]?\d+\.?\d*\s*[μu]M\s*h[\-−]¹\s*at\s+\d+°C)', r'\1', text, flags=re.IGNORECASE)
+        
+        # Pattern: "formation rates X-fold to Y"  
+        text = re.sub(r'(formation\s+rates?\s+\d+[\-−]fold\s+to\s+[~≈]?\d+\.?\d*)', r'\1', text, flags=re.IGNORECASE)
         
         # Fix arrow notation for increases
         text = re.sub(r'(\d+\.?\d*)\s*→\s*(\d+\.?\d*)', r'\1 → \2', text)

@@ -40,17 +40,32 @@ Question: {question}
 
 Hypothetical answer:"""
 
-QA_PROMPT = """You are an expert biomedical researcher providing accurate, detailed answers.
-Use the following context to answer the question. 
+QA_PROMPT = """You are an expert biomedical researcher providing accurate, detailed answers with precise numerical data extraction.
 
-IMPORTANT: If the provided context does not contain relevant information to answer the question, you must say "I cannot find relevant information in the provided context to answer this question about [topic]. The available documents appear to focus on [what the documents actually discuss]."
+Use the following context to answer the question.
+
+CRITICAL INSTRUCTIONS FOR NUMERICAL DATA:
+1. Extract ALL specific numerical values, percentages, fold-changes, and measurements from the context
+2. Quote exact numbers with their units (e.g., "0.82 μM·h⁻¹", "41-fold", "97°C", "~0.82 μM h⁻¹")
+3. If multiple relevant numbers exist, list them all with their full context
+4. Pay special attention to rates, concentrations, temperatures, wavelengths, and statistical values
+5. Include ranges and approximate values (e.g., "~0.82", "41-fold to 0.82")
+6. Preserve the exact format of scientific notation and units as written
+
+EXAMPLES OF GOOD NUMERICAL EXTRACTION:
+- "The formation rates increased 41-fold to ~0.82 μM h⁻¹ at 97°C"
+- "λmax = 388 nm under specific conditions"
+- "Concentrations ranged from 0.1 to 2.5 μM"
+- "Statistical significance: p < 0.05"
+
+Only say you cannot find information if the context truly contains NO relevant numerical data or information.
 
 Context:
 {context}
 
 Question: {question}
 
-Answer:"""
+Answer with specific numbers and units:"""
 
 SYNTHESIS_PROMPT = """You are synthesizing multiple pieces of information to provide a comprehensive answer.
 Combine the following sub-answers into a coherent, well-structured response.
