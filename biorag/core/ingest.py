@@ -5,26 +5,17 @@ Handles document loading, parsing, and chunking from multiple sources
 
 import os
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, TYPE_CHECKING
 from datetime import datetime
 import hashlib
 import re
-import feedparser
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse
-import PyPDF2
-import pdfplumber
-from unstructured.partition.pdf import partition_pdf
-from unstructured.partition.html import partition_html
-from unstructured.partition.text import partition_text
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
 import logging
-import pytesseract
-from PIL import Image
-import io
-import fitz  # PyMuPDF for better PDF handling
+
+# Type checking imports
+if TYPE_CHECKING:
+    from langchain.schema import Document
+
+# Lazy imports - only load heavy dependencies when needed
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -60,16 +51,14 @@ class IngestPipeline:
         self.enable_ocr = enable_ocr
 
         # Default separators optimized for scientific text
+        # Use regex patterns for case-insensitive and boundary-aware matching
         self.separators = separators or [
             "\n[SECTION:",  # Section headers  
             "\n[TABLE]",    # Table markers
             "\n[FIGURE CAPTION]",  # Figure captions
             "\n\n\n",  # Multiple newlines (section breaks)
             "\n\n",  # Paragraph breaks
-            "\nResults",  # Results section
-            "\nDiscussion",  # Discussion section
-            "\nMethods",  # Methods section
-            "\nConclusion",  # Conclusion section
+            # Note: Case-insensitive section detection will be handled in preprocessing
             "\n",  # Line breaks
             ". ",  # Sentence ends
             "! ",
@@ -80,7 +69,8 @@ class IngestPipeline:
             ""  # Characters
         ]
 
-        # Initialize text splitter
+        # Initialize text splitter (lazy import)
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -88,19 +78,25 @@ class IngestPipeline:
             length_function=len
         )
 
-        # Cache for processed documents
+        # Thread-safe cache for processed documents
+        import threading
         self.doc_cache = {}
+        self._cache_lock = threading.RLock()
 
-        # Check OCR availability
+        # Check OCR availability (lazy import)
         if self.enable_ocr:
             try:
+                import pytesseract
                 pytesseract.get_tesseract_version()
                 logger.info("OCR enabled with Tesseract")
+            except ImportError:
+                logger.warning("pytesseract not installed. OCR disabled.")
+                self.enable_ocr = False
             except Exception:
                 logger.warning("Tesseract not found. OCR disabled.")
                 self.enable_ocr = False
 
-    def ingest_file(self, file_path: Union[str, Path]) -> List[Document]:
+    def ingest_file(self, file_path: Union[str, Path]) -> List["Document"]:
         """
         Ingest a single file and return chunked documents
 
@@ -117,9 +113,12 @@ class IngestPipeline:
 
         # Generate cache key including chunk parameters
         cache_key = self._generate_cache_key(file_path)
-        if cache_key in self.doc_cache:
-            logger.info(f"Using cached version of {file_path.name}")
-            return self.doc_cache[cache_key]
+        
+        # Thread-safe cache access
+        with self._cache_lock:
+            if cache_key in self.doc_cache:
+                logger.info(f"Using cached version of {file_path.name}")
+                return self.doc_cache[cache_key]
 
         # Determine file type and process accordingly
         suffix = file_path.suffix.lower()
@@ -134,8 +133,9 @@ class IngestPipeline:
             else:
                 raise ValueError(f"Unsupported file type: {suffix}")
 
-            # Cache the results
-            self.doc_cache[cache_key] = documents
+            # Thread-safe cache storage
+            with self._cache_lock:
+                self.doc_cache[cache_key] = documents
 
             return documents
 
@@ -143,24 +143,93 @@ class IngestPipeline:
             logger.error(f"Error ingesting {file_path}: {str(e)}")
             raise
 
-    def ingest_url(self, url: str) -> List[Document]:
+    def ingest_url(self, url: str, allowed_domains: Optional[List[str]] = None,
+                   max_size_mb: int = 50) -> List["Document"]:
         """
-        Ingest content from a web URL
+        Ingest content from a web URL with security guards and retries
 
         Args:
             url: Web page URL
+            allowed_domains: List of allowed domains (security filter)
+            max_size_mb: Maximum content size in MB
 
         Returns:
             List of Document objects
         """
         try:
-            response = requests.get(url, timeout=30, headers={
-                'User-Agent': 'Mozilla/5.0 (compatible; BioRAG/1.0)'
-            })
+            # Lazy imports for network operations
+            import requests
+            from bs4 import BeautifulSoup
+            from urllib.parse import urlparse
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            import ipaddress
+            
+            # Parse and validate URL
+            parsed_url = urlparse(url)
+            if not parsed_url.scheme or not parsed_url.netloc:
+                raise ValueError(f"Invalid URL: {url}")
+            
+            # Check allowed domains
+            if allowed_domains and parsed_url.netloc.lower() not in [d.lower() for d in allowed_domains]:
+                raise ValueError(f"Domain {parsed_url.netloc} not in allowed domains: {allowed_domains}")
+            
+            # Block internal IP ranges (SSRF protection)
+            try:
+                import socket
+                ip = socket.gethostbyname(parsed_url.netloc)
+                ip_addr = ipaddress.ip_address(ip)
+                if ip_addr.is_private or ip_addr.is_loopback or ip_addr.is_link_local:
+                    raise ValueError(f"Access to internal IP address {ip} is blocked")
+            except (socket.gaierror, ValueError) as e:
+                if "internal IP" in str(e):
+                    raise
+                # DNS resolution failed, but continue (might be OK)
+                logger.warning(f"Could not resolve {parsed_url.netloc}: {e}")
+            
+            # Set up session with retries
+            session = requests.Session()
+            
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "OPTIONS"]
+            )
+            
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            
+            # Make request with size limit
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (compatible; BioRAG/1.0)',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive'
+            }
+            
+            response = session.get(url, timeout=30, headers=headers, stream=True)
             response.raise_for_status()
-
+            
+            # Check content length
+            content_length = response.headers.get('content-length')
+            if content_length:
+                size_mb = int(content_length) / (1024 * 1024)
+                if size_mb > max_size_mb:
+                    raise ValueError(f"Content too large: {size_mb:.1f}MB > {max_size_mb}MB")
+            
+            # Read content with size limit
+            content = b""
+            max_bytes = max_size_mb * 1024 * 1024
+            for chunk in response.iter_content(chunk_size=8192):
+                content += chunk
+                if len(content) > max_bytes:
+                    raise ValueError(f"Content exceeded size limit: {max_size_mb}MB")
+            
             # Parse HTML content
-            soup = BeautifulSoup(response.content, 'html.parser')
+            soup = BeautifulSoup(content, 'html.parser')
 
             # Remove script and style elements
             for script in soup(["script", "style"]):
@@ -196,20 +265,36 @@ class IngestPipeline:
             logger.error(f"Error ingesting URL {url}: {str(e)}")
             raise
 
-    def ingest_rss(self, rss_url: str, max_items: int = 20) -> List[Document]:
+    def ingest_rss(self, rss_url: str, max_items: int = 20, 
+                   allowed_domains: Optional[List[str]] = None) -> List["Document"]:
         """
-        Ingest articles from an RSS feed
+        Ingest articles from an RSS feed with security controls
 
         Args:
             rss_url: RSS feed URL
             max_items: Maximum number of items to fetch
+            allowed_domains: List of allowed domains (security filter)
 
         Returns:
             List of Document objects
         """
         try:
-            # Parse RSS feed
-            feed = feedparser.parse(rss_url)
+            # Lazy imports for RSS operations
+            import feedparser
+            from bs4 import BeautifulSoup
+            from urllib.parse import urlparse
+            
+            # Validate RSS URL
+            parsed_url = urlparse(rss_url)
+            if not parsed_url.scheme or not parsed_url.netloc:
+                raise ValueError(f"Invalid RSS URL: {rss_url}")
+            
+            # Check allowed domains
+            if allowed_domains and parsed_url.netloc.lower() not in [d.lower() for d in allowed_domains]:
+                raise ValueError(f"Domain {parsed_url.netloc} not in allowed domains: {allowed_domains}")
+            
+            # Parse RSS feed with user agent
+            feed = feedparser.parse(rss_url, agent='BioRAG/1.0')
 
             if feed.bozo:
                 raise ValueError(f"Error parsing RSS feed: {feed.bozo_exception}")
@@ -279,7 +364,7 @@ class IngestPipeline:
             logger.error(f"Error ingesting RSS feed {rss_url}: {str(e)}")
             raise
 
-    def _ingest_pdf(self, file_path: Path) -> List[Document]:
+    def _ingest_pdf(self, file_path: Path) -> List["Document"]:
         """Ingest PDF file with multiple fallback strategies"""
         text = ""
         metadata = {
@@ -291,6 +376,7 @@ class IngestPipeline:
 
         # Try method 1: Unstructured (best for complex PDFs)
         try:
+            from unstructured.partition.pdf import partition_pdf
             elements = partition_pdf(
                 filename=str(file_path),
                 strategy="hi_res",  # High resolution processing
@@ -333,6 +419,7 @@ class IngestPipeline:
 
         # Try method 2: pdfplumber (good for tables)
         try:
+            import pdfplumber
             text = ""
             with pdfplumber.open(file_path) as pdf:
                 # Extract metadata
@@ -371,6 +458,7 @@ class IngestPipeline:
 
         # Try method 3: PyPDF2 (basic fallback)
         try:
+            import PyPDF2
             text = ""
             with open(file_path, 'rb') as file:
                 reader = PyPDF2.PdfReader(file)
@@ -401,6 +489,11 @@ class IngestPipeline:
         # Try method 4: PyMuPDF with OCR fallback
         if self.enable_ocr:
             try:
+                import fitz  # PyMuPDF
+                import pytesseract
+                from PIL import Image
+                import io
+                
                 text = ""
                 doc = fitz.open(file_path)
 
@@ -440,9 +533,12 @@ class IngestPipeline:
         # If all methods failed
         raise ValueError(f"Could not extract text from PDF: {file_path.name}")
 
-    def _ingest_html(self, file_path: Path) -> List[Document]:
+    def _ingest_html(self, file_path: Path) -> List["Document"]:
         """Ingest HTML file"""
         try:
+            # Lazy import for HTML processing
+            from unstructured.partition.html import partition_html
+            
             # Use Unstructured for HTML
             elements = partition_html(filename=str(file_path))
 
@@ -470,7 +566,7 @@ class IngestPipeline:
             logger.error(f"Error parsing HTML file {file_path}: {str(e)}")
             raise
 
-    def _ingest_text(self, file_path: Path) -> List[Document]:
+    def _ingest_text(self, file_path: Path) -> List["Document"]:
         """Ingest plain text file"""
         try:
             # Read file with encoding detection
@@ -503,7 +599,7 @@ class IngestPipeline:
             logger.error(f"Error reading text file {file_path}: {str(e)}")
             raise
 
-    def _create_chunks(self, text: str, metadata: Dict[str, Any]) -> List[Document]:
+    def _create_chunks(self, text: str, metadata: Dict[str, Any]) -> List["Document"]:
         """
         Create document chunks with metadata
 
@@ -514,10 +610,15 @@ class IngestPipeline:
         Returns:
             List of Document chunks
         """
+        # Preprocess text for better section detection
+        processed_text = self._preprocess_for_sections(text)
+        
         # Split text into chunks
-        chunks = self.text_splitter.split_text(text)
+        chunks = self.text_splitter.split_text(processed_text)
 
-        # Create Document objects
+        # Create Document objects (lazy import)
+        from langchain.schema import Document
+        
         documents = []
         
         # Generate document ID if not present
@@ -541,6 +642,18 @@ class IngestPipeline:
                 'chunk_total': len(chunks),
                 'chunk_size': len(chunk)
             })
+            
+            # Validate required metadata fields are present
+            required_fields = ['doc_id', 'chunk_idx', 'section']
+            for field in required_fields:
+                if field not in chunk_metadata or chunk_metadata[field] is None:
+                    logger.warning(f"Required metadata field '{field}' is missing or None, using default")
+                    if field == 'doc_id':
+                        chunk_metadata[field] = f"unknown_{hashlib.md5(chunk.encode()).hexdigest()[:8]}"
+                    elif field == 'chunk_idx':
+                        chunk_metadata[field] = i
+                    elif field == 'section':
+                        chunk_metadata[field] = 'content'
 
             # Create document
             doc = Document(
@@ -654,16 +767,57 @@ class IngestPipeline:
 
         return text
 
+    def _preprocess_for_sections(self, text: str) -> str:
+        """
+        Preprocess text for better section detection with case-insensitive and boundary-aware matching
+        
+        Args:
+            text: Raw text
+            
+        Returns:
+            Text with normalized section headers
+        """
+        import re
+        
+        # Define section patterns with word boundaries for better matching
+        section_patterns = [
+            (r'\b(results?)\b', '\nResults'),
+            (r'\b(discussions?)\b', '\nDiscussion'), 
+            (r'\b(methods?)\b', '\nMethods'),
+            (r'\b(methodology)\b', '\nMethods'),
+            (r'\b(experimental\s+(?:section|procedure|setup))\b', '\nMethods'),
+            (r'\b(conclusions?)\b', '\nConclusion'),
+            (r'\b(summary)\b', '\nConclusion'),
+            (r'\b(introduction)\b', '\nIntroduction'),
+            (r'\b(background)\b', '\nIntroduction'),
+            (r'\b(abstracts?)\b', '\nAbstract'),
+            (r'\b(references?)\b', '\nReferences'),
+            (r'\b(bibliography)\b', '\nReferences'),
+        ]
+        
+        # Apply case-insensitive replacements with word boundaries
+        processed_text = text
+        for pattern, replacement in section_patterns:
+            # Only replace when the section word appears at the start of a line or after whitespace
+            line_pattern = r'(?:^|\n)\s*' + pattern
+            processed_text = re.sub(line_pattern, replacement, processed_text, flags=re.IGNORECASE | re.MULTILINE)
+        
+        return processed_text
+
     def _generate_cache_key(self, file_path: Path) -> str:
-        """Generate cache key including file hash and chunking params"""
-        # Get file hash
+        """Generate cache key including file hash, modification time, and chunking params"""
+        # Get file content hash and modification time for cache invalidation
         file_hash = self._hash_file(file_path)
+        mod_time = int(file_path.stat().st_mtime)
+        file_size = file_path.stat().st_size
 
         # Include chunking parameters in cache key
         param_str = f"{self.chunk_size}_{self.chunk_overlap}_{'_'.join(self.separators[:3])}"
         param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
 
-        return f"{file_hash}_{param_hash}"
+        # Create comprehensive cache key that changes when file content changes
+        cache_key = f"{file_hash}_{mod_time}_{file_size}_{param_hash}"
+        return cache_key
 
     def _hash_file(self, file_path: Path) -> str:
         """Generate hash for file content"""
@@ -678,7 +832,8 @@ class IngestPipeline:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
 
-        # Recreate text splitter
+        # Recreate text splitter (lazy import)
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -686,8 +841,9 @@ class IngestPipeline:
             length_function=len
         )
 
-        # Clear cache since parameters changed
-        self.doc_cache.clear()
+        # Thread-safe cache clearing
+        with self._cache_lock:
+            self.doc_cache.clear()
         logger.info(f"Updated chunk parameters: size={chunk_size}, overlap={chunk_overlap}")
     
     def _generate_doc_id(self, metadata: Dict[str, Any]) -> str:

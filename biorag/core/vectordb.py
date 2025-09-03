@@ -74,21 +74,9 @@ class VectorDBManager:
                 logger.warning("OpenAI requested but no API key found, falling back to default")
                 model_name = "sentence-transformers/all-MiniLM-L6-v2"
 
-        # Biomedical models mapping
-        bio_models = {
-            # PROPER sentence-transformers models (fine-tuned for similarity)
-            "scibert": "sentence-transformers/all-mpnet-base-v2",  # GPT's recommended baseline
-            "scibert-sentence": "pritamdeka/S-Scibert-snli-multinli-stsb",
-            "biobert-sentence": "pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb", 
-            "mpnet": "sentence-transformers/all-mpnet-base-v2",  # GPT's recommended baseline
-            "minilm": "sentence-transformers/all-MiniLM-L6-v2",
-            # Legacy BERT models (not recommended for retrieval)
-            "scibert-legacy": "allenai/scibert_scivocab_uncased",
-            "biobert": "dmis-lab/biobert-v1.1", 
-            "pubmedbert": "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",
-            "bioclinicalbert": "emilyalsentzer/Bio_ClinicalBERT",
-            "default": "sentence-transformers/all-mpnet-base-v2"  # GPT's recommended baseline
-        }
+        # Import centralized model configuration
+        from .config import default_config
+        bio_models = default_config.models.embedding_models
 
         # Resolve model name
         if model_name in bio_models:
@@ -528,12 +516,17 @@ class VectorDBManager:
         metadata_str = json.dumps(doc.metadata, sort_keys=True)
         return hashlib.md5(f"{content_part}{metadata_str}".encode()).hexdigest()
 
-    def _get_collection_size(self, vectordb: Chroma) -> int:
+    def get_collection_size(self, vectordb: Chroma) -> int:
         """Get the size of the collection efficiently"""
         try:
             return vectordb._collection.count()
-        except:
+        except Exception as e:
+            logger.warning(f"Could not get collection size: {str(e)}")
             return 0
+
+    def _get_collection_size(self, vectordb: Chroma) -> int:
+        """Legacy method - deprecated, use get_collection_size instead"""
+        return self.get_collection_size(vectordb)
 
     def _save_metadata(self):
         """Save metadata about the database"""

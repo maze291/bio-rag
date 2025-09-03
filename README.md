@@ -182,7 +182,7 @@ This system demonstrates that with proper RAG engineering, you can build domain-
 
 5. **Adapt to Domain Needs**: Specialized components for biomedical entity linking, jargon explanation, and scientific notation handling
 
-## Current Status: WORKING ✅
+## Current Status: WORKING ✅ (maybe)
 
 **Problem Solved**: The numerical extraction issue has been resolved through:
 

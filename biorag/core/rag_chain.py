@@ -7,6 +7,7 @@ import os
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import logging
+import hashlib
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
@@ -90,6 +91,37 @@ class QueryResult:
     confidence: float = 0.0
 
 
+@dataclass
+class RetrievalConfig:
+    """Configuration for retrieval parameters"""
+    # Standard retrieval
+    similarity_k: int = 40
+    mmr_k: int = 15
+    mmr_fetch_k: int = 40
+    
+    # Ensemble retrieval
+    ensemble_k: int = 25
+    
+    # Neighbor expansion
+    neighbor_window: int = 2
+    
+    # Reranking
+    rerank_top_n: int = 15
+    
+    # Fast mode (reduced parameters for speed)
+    fast_mode: bool = False
+    
+    def __post_init__(self):
+        """Apply fast mode settings if enabled"""
+        if self.fast_mode:
+            self.similarity_k = 15
+            self.mmr_k = 8
+            self.mmr_fetch_k = 20
+            self.ensemble_k = 12
+            self.neighbor_window = 1
+            self.rerank_top_n = 8
+
+
 class RAGChain:
     """
     Orchestrates the complete RAG pipeline with advanced features
@@ -99,7 +131,8 @@ class RAGChain:
                  vector_db,
                  entity_linker,
                  glossary_manager,
-                 llm_model: Optional[str] = None):
+                 llm_model: Optional[str] = None,
+                 retrieval_config: Optional[RetrievalConfig] = None):
         """
         Initialize RAG chain
 
@@ -108,23 +141,27 @@ class RAGChain:
             entity_linker: Entity linking instance
             glossary_manager: Glossary manager instance
             llm_model: Optional LLM model name
+            retrieval_config: Configuration for retrieval parameters
         """
         self.vector_db = vector_db
         self.entity_linker = entity_linker
         self.glossary_manager = glossary_manager
+        
+        # Store retrieval configuration
+        self.config = retrieval_config or RetrievalConfig()
 
         # Initialize LLM
         self.llm = self._init_llm(llm_model)
 
-        # Initialize retrievers with higher coverage for scientific papers
+        # Initialize retrievers with configurable parameters
         self.retriever = vector_db.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": 40}  # Even more for ensemble fusion
+            search_kwargs={"k": self.config.similarity_k}
         )
 
         self.mmr_retriever = vector_db.as_retriever(
             search_type="mmr", 
-            search_kwargs={"k": 15, "fetch_k": 40}  # Much higher diversity and coverage
+            search_kwargs={"k": self.config.mmr_k, "fetch_k": self.config.mmr_fetch_k}
         )
 
         # Initialize enhanced retrieval components
@@ -137,8 +174,16 @@ class RAGChain:
             # Try to set up ensemble retriever if documents already exist
             self.ensemble_retriever = None
             try:
-                # Check if vector DB has documents
-                doc_count = vector_db._collection.count() if hasattr(vector_db, '_collection') else 0
+                # Check if vector DB has documents using safe method
+                doc_count = 0
+                try:
+                    # Try to get collection size safely
+                    collection = getattr(vector_db, '_collection', None)
+                    if collection:
+                        doc_count = collection.count()
+                except Exception:
+                    doc_count = 0
+                
                 if doc_count > 0:
                     # Try to get some documents from the vector DB to initialize BM25
                     existing_docs = self._get_sample_documents_from_db(vector_db)
@@ -157,6 +202,23 @@ class RAGChain:
         # Initialize chains
         self._init_chains()
 
+    def update_config(self, new_config: RetrievalConfig):
+        """Update retrieval configuration and recreate retrievers"""
+        self.config = new_config
+        
+        # Recreate retrievers with new parameters
+        self.retriever = self.vector_db.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": self.config.similarity_k}
+        )
+
+        self.mmr_retriever = self.vector_db.as_retriever(
+            search_type="mmr", 
+            search_kwargs={"k": self.config.mmr_k, "fetch_k": self.config.mmr_fetch_k}
+        )
+        
+        logger.info(f"Updated retrieval configuration: fast_mode={self.config.fast_mode}")
+
     def setup_ensemble_retriever(self, documents: List[Document]):
         """
         Setup ensemble retriever once documents are available
@@ -172,7 +234,8 @@ class RAGChain:
                     logger.info(f"📥 Enhancing document metadata for ensemble retriever compatibility")
                     # Add missing metadata if needed
                     if 'doc_id' not in doc.metadata:
-                        doc.metadata['doc_id'] = f"doc_{hash(doc.page_content[:100]) % 10000}"
+                        content_hash = hashlib.sha1(doc.page_content[:512].encode("utf-8")).hexdigest()[:8]
+                        doc.metadata['doc_id'] = f"doc_{content_hash}"
                     if 'chunk_idx' not in doc.metadata:
                         doc.metadata['chunk_idx'] = doc.metadata.get('chunk_id', 0)
                 enhanced_docs.append(doc)
@@ -185,19 +248,23 @@ class RAGChain:
 
     def _init_llm(self, model_name: Optional[str] = None):
         """Initialize language model"""
+        # Import centralized configuration
+        from .config import default_config
+        
         # Check for OpenAI
         if model_name == "openai" or (not model_name and os.getenv("OPENAI_API_KEY")):
-            logger.info("Using OpenAI GPT-4")
+            logger.info(f"Using OpenAI {default_config.models.openai_model}")
             return ChatOpenAI(
-                model_name="gpt-4o-mini",
+                model_name=default_config.models.openai_model,
                 temperature=0,
                 max_tokens=2000
             )
         else:
             # Use Ollama
-            logger.info("Using Ollama Llama3")
+            ollama_model = model_name or default_config.models.ollama_model
+            logger.info(f"Using Ollama {ollama_model}")
             return Ollama(
-                model=model_name or "llama3",
+                model=ollama_model,
                 temperature=0,
                 num_ctx=8192  # Increased context window
             )
@@ -436,33 +503,33 @@ class RAGChain:
                             queries: List[str],
                             use_mmr: bool = True) -> List[Document]:
         """Retrieve documents using enhanced ensemble + neighbor expansion"""
-        logger.info(f"📥 RETRIEVAL PIPELINE: Starting document retrieval")
-        logger.info(f"📥 Input: {len(queries)} queries, use_mmr={use_mmr}")
+        logger.debug(f"📥 RETRIEVAL PIPELINE: Starting document retrieval")
+        logger.debug(f"📥 Input: {len(queries)} queries, use_mmr={use_mmr}")
         
         all_docs = []
         seen_content = set()
 
         for query_idx, query in enumerate(queries):
             if not query or not query.strip():
-                logger.info(f"📥 Query {query_idx+1}: Skipping empty query")
+                logger.debug(f"📥 Query {query_idx+1}: Skipping empty query")
                 continue
 
             try:
-                logger.info(f"📥 ========== PROCESSING QUERY {query_idx+1}/{len(queries)} ==========")
-                logger.info(f"📥 Query: '{query}'")
-                logger.info(f"📥 Query length: {len(query)} chars")
-                logger.info(f"📥 Ensemble retriever available: {self.ensemble_retriever is not None}")
+                logger.debug(f"📥 ========== PROCESSING QUERY {query_idx+1}/{len(queries)} ==========")
+                logger.debug(f"📥 Query: '{query}'")
+                logger.debug(f"📥 Query length: {len(query)} chars")
+                logger.debug(f"📥 Ensemble retriever available: {self.ensemble_retriever is not None}")
                 
                 # Check for scientific terms
-                logger.info(f"📥 Analyzing query for scientific terms...")
+                logger.debug(f"📥 Analyzing query for scientific terms...")
                 has_scientific = self._has_numeric_terms(query)
-                logger.info(f"📥 Scientific analysis result: {has_scientific}")
+                logger.debug(f"📥 Scientific analysis result: {has_scientific}")
                 
                 # Use ensemble retriever if available (BM25 + Dense)
                 if self.ensemble_retriever and has_scientific:
                     logger.info(f"✅ DECISION: Using ENSEMBLE retrieval (BM25 + Dense)")
                     logger.info(f"✅ Reason: Ensemble available AND scientific terms detected")
-                    docs = self.ensemble_retriever.get_relevant_documents(query, k=25)
+                    docs = self.ensemble_retriever.get_relevant_documents(query, k=self.config.ensemble_k)
                 else:
                     if not self.ensemble_retriever:
                         logger.info(f"ℹ️ DECISION: Using STANDARD retrieval (ensemble not available)")
@@ -478,20 +545,20 @@ class RAGChain:
 
                 # Expand with neighbors for distributed details
                 if self.neighbor_expander and len(docs) > 0:
-                    logger.info(f"📥 NEIGHBOR EXPANSION: Processing {len(docs)} documents")
-                    docs = self.neighbor_expander.expand_with_neighbors(docs, window=2)
-                    logger.info(f"📥 After neighbor expansion: {len(docs)} documents")
+                    logger.debug(f"📥 NEIGHBOR EXPANSION: Processing {len(docs)} documents")
+                    docs = self.neighbor_expander.expand_with_neighbors(docs, window=self.config.neighbor_window)
+                    logger.debug(f"📥 After neighbor expansion: {len(docs)} documents")
                 else:
-                    logger.info(f"📥 Skipping neighbor expansion (expander={self.neighbor_expander is not None}, docs={len(docs)})")
+                    logger.debug(f"📥 Skipping neighbor expansion (expander={self.neighbor_expander is not None}, docs={len(docs)})")
 
                 # Deduplicate based on content hash and apply section boosting
-                logger.info(f"📥 DEDUPLICATION: Processing {len(docs)} documents")
+                logger.debug(f"📥 DEDUPLICATION: Processing {len(docs)} documents")
                 docs_added = 0
                 docs_duplicate = 0
                 
                 for doc in docs:
                     content_preview = doc.page_content[:200]
-                    content_hash = hash(content_preview)
+                    content_hash = hashlib.sha1(content_preview.encode("utf-8")).hexdigest()[:8]
 
                     if content_hash not in seen_content:
                         seen_content.add(content_hash)
@@ -507,39 +574,39 @@ class RAGChain:
                         
                         if boosted_score != original_score:
                             section = doc.metadata.get('section', 'unknown')
-                            logger.info(f"📥 Section boost applied: {section} ({original_score:.3f} → {boosted_score:.3f})")
+                            logger.debug(f"📥 Section boost applied: {section} ({original_score:.3f} → {boosted_score:.3f})")
                         
                         all_docs.append(doc)
                         docs_added += 1
                     else:
                         docs_duplicate += 1
                 
-                logger.info(f"📥 Deduplication: {docs_added} new, {docs_duplicate} duplicates")
-                logger.info(f"📥 Running total: {len(all_docs)} unique documents")
+                logger.debug(f"📥 Deduplication: {docs_added} new, {docs_duplicate} duplicates")
+                logger.debug(f"📥 Running total: {len(all_docs)} unique documents")
 
             except Exception as e:
                 logger.error(f"💥 Error in enhanced retrieval for query '{query[:50]}...': {str(e)}")
-                logger.info(f"📥 Attempting fallback retrieval...")
+                logger.debug(f"📥 Attempting fallback retrieval...")
                 # Fallback to basic retrieval
                 try:
                     fallback_docs = self.retriever.get_relevant_documents(query)
                     all_docs.extend(fallback_docs)
-                    logger.info(f"📥 Fallback successful: {len(fallback_docs)} documents added")
+                    logger.debug(f"📥 Fallback successful: {len(fallback_docs)} documents added")
                 except Exception as fallback_e:
                     logger.error(f"💥 Fallback also failed: {str(fallback_e)}")
 
         # Sort by relevance score if available
-        logger.info(f"📥 FINAL SORTING: Sorting {len(all_docs)} documents by relevance score")
+        logger.debug(f"📥 FINAL SORTING: Sorting {len(all_docs)} documents by relevance score")
         try:
             all_docs.sort(key=lambda d: d.metadata.get('score', 0), reverse=True)
-            logger.info(f"📥 Sorting successful")
+            logger.debug(f"📥 Sorting successful")
             
             # Log top documents before reranking
-            logger.info(f"📥 Top 3 documents before reranking:")
+            logger.debug(f"📥 Top 3 documents before reranking:")
             for i, doc in enumerate(all_docs[:3]):
                 score = doc.metadata.get('score', 'N/A')
                 preview = doc.page_content[:100].replace('\n', ' ')
-                logger.info(f"📥 #{i+1} (score={score}): {preview}...")
+                logger.debug(f"📥 #{i+1} (score={score}): {preview}...")
         except Exception as sort_e:
             logger.error(f"💥 Sorting failed: {str(sort_e)}")
 
@@ -550,9 +617,9 @@ class RAGChain:
         if len(all_docs) > 1 and self.reranker and self.reranker.is_available() and not should_skip_reranker:
             logger.info(f"🎯 CROSS-ENCODER RERANKING: Processing {len(all_docs)} documents")
             
-            # Rerank top 15 documents for speed (fast path optimization)
-            docs_to_rerank = all_docs[:15] if len(all_docs) > 15 else all_docs
-            remaining_docs = all_docs[15:] if len(all_docs) > 15 else []
+            # Rerank top N documents for speed (configurable optimization)
+            docs_to_rerank = all_docs[:self.config.rerank_top_n] if len(all_docs) > self.config.rerank_top_n else all_docs
+            remaining_docs = all_docs[self.config.rerank_top_n:] if len(all_docs) > self.config.rerank_top_n else []
             
             # Get the original query for reranking
             original_query = queries[0] if queries else ""  # Use first query as primary
@@ -568,14 +635,14 @@ class RAGChain:
             if should_skip_reranker:
                 logger.info(f"⚡ FAST PATH: Skipping reranker due to exact match confidence")
             else:
-                logger.info(f"📥 Skipping reranking (docs={len(all_docs)}, reranker_available={self.reranker.is_available() if self.reranker else False})")
+                logger.debug(f"📥 Skipping reranking (docs={len(all_docs)}, reranker_available={self.reranker.is_available() if self.reranker else False})")
 
         logger.info(f"✅ RETRIEVAL COMPLETE: {len(all_docs)} unique documents ready for answer generation")
         return all_docs
 
     def _has_numeric_terms(self, query: str) -> bool:
         """Check if query contains numeric/scientific terms that benefit from BM25"""
-        logger.info(f"🔬 SCIENTIFIC TERM ANALYSIS: Starting analysis of query: '{query}'")
+        logger.debug(f"🔬 SCIENTIFIC TERM ANALYSIS: Starting analysis of query: '{query}'")
         
         # Enhanced patterns for scientific queries (high-value detectors)
         scientific_terms = [
@@ -614,53 +681,47 @@ class RAGChain:
         ]
         
         query_lower = query.lower()
-        logger.info(f"🔬 Query lowercased: '{query_lower}'")
+        logger.debug(f"🔬 Query lowercased: '{query_lower}'")
         
         # Check each pattern with detailed logging
-        logger.info(f"🔬 Checking {len(scientific_terms)} scientific patterns...")
+        logger.debug(f"🔬 Checking {len(scientific_terms)} scientific patterns...")
         
         for i, term in enumerate(scientific_terms):
             if isinstance(term, str):
                 # Direct string match
-                logger.info(f"🔬 Pattern {i+1}/{len(scientific_terms)}: Checking string '{term}' in query_lower")
                 if term in query_lower:
-                    logger.info(f"✅ MATCH! Scientific term detected: '{term}' found in '{query_lower}'")
-                    logger.info(f"🎯 DECISION: Using ensemble retrieval due to scientific term: {term}")
+                    logger.debug(f"✅ MATCH! Scientific term detected: '{term}' found in '{query_lower}'")
+                    logger.debug(f"🎯 DECISION: Using ensemble retrieval due to scientific term: {term}")
                     return True
-                else:
-                    logger.info(f"❌ No match for string pattern: '{term}'")
             else:
                 # Regex pattern
-                logger.info(f"🔬 Pattern {i+1}/{len(scientific_terms)}: Checking regex '{term}' against query")
                 match = re.search(term, query, re.IGNORECASE)
                 if match:
-                    logger.info(f"✅ MATCH! Scientific regex pattern detected: '{term}' matched '{match.group()}' in query")
-                    logger.info(f"🎯 DECISION: Using ensemble retrieval due to regex pattern: {term}")
+                    logger.debug(f"✅ MATCH! Scientific regex pattern detected: '{term}' matched '{match.group()}' in query")
+                    logger.debug(f"🎯 DECISION: Using ensemble retrieval due to regex pattern: {term}")
                     return True
-                else:
-                    logger.info(f"❌ No match for regex pattern: '{term}'")
         
         # Enhanced process terms - more comprehensive
-        logger.info(f"🔬 Checking secondary process terms...")
+        logger.debug(f"🔬 Checking secondary process terms...")
         process_terms = ['formation', 'conditions', 'rates', 'process', 'mechanism',
                         'experimental', 'concentration', 'buffer', 'specific', 'mentioned']
         
         for term in process_terms:
             if term in query_lower:
-                logger.info(f"✅ MATCH! Scientific process term detected: '{term}' in '{query_lower}'")
-                logger.info(f"🎯 DECISION: Using ensemble retrieval due to process term: {term}")
+                logger.debug(f"✅ MATCH! Scientific process term detected: '{term}' in '{query_lower}'")
+                logger.debug(f"🎯 DECISION: Using ensemble retrieval due to process term: {term}")
                 return True
             
         # Check for any numbers that might indicate scientific measurements
-        logger.info(f"🔬 Checking for numeric patterns in query...")
+        logger.debug(f"🔬 Checking for numeric patterns in query...")
         number_match = re.search(r'\d+', query)
         if number_match:
-            logger.info(f"✅ MATCH! Numeric pattern detected: '{number_match.group()}' in query")
-            logger.info(f"🎯 DECISION: Using ensemble retrieval due to numeric content")
+            logger.debug(f"✅ MATCH! Numeric pattern detected: '{number_match.group()}' in query")
+            logger.debug(f"🎯 DECISION: Using ensemble retrieval due to numeric content")
             return True
         
-        logger.info(f"❌ FINAL RESULT: No scientific terms detected in query: '{query}'")
-        logger.info(f"🎯 DECISION: Using standard MMR retrieval (no scientific terms found)")
+        logger.debug(f"❌ FINAL RESULT: No scientific terms detected in query: '{query}'")
+        logger.debug(f"🎯 DECISION: Using standard MMR retrieval (no scientific terms found)")
         return False
     
     def _should_skip_reranker(self, queries: List[str], documents: List[Document]) -> bool:

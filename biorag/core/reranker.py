@@ -15,19 +15,21 @@ class CrossEncoderReranker:
     Essential after ensemble fusion for scientific queries
     """
     
-    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L6-v2"):
+    def __init__(self, model_name: Optional[str] = None):
         """
         Initialize cross-encoder reranker
         
         Args:
-            model_name: HuggingFace cross-encoder model name
+            model_name: HuggingFace cross-encoder model name (uses default from config if None)
         """
-        self.model_name = model_name
+        # Import centralized configuration
+        from .config import default_config
+        self.model_name = model_name or default_config.models.reranker_model
         self.model = None
         
         try:
-            logger.info(f"Loading cross-encoder model: {model_name}")
-            self.model = CrossEncoder(model_name)
+            logger.info(f"Loading cross-encoder model: {self.model_name}")
+            self.model = CrossEncoder(self.model_name)
             logger.info("✅ Cross-encoder reranker loaded successfully")
         except Exception as e:
             logger.error(f"💥 Failed to load cross-encoder: {str(e)}")
